@@ -366,6 +366,22 @@
             color: var(--accent-primary);
         }
 
+        .settings-menu-item {
+            display: block;
+            padding: 0.75rem;
+            border-radius: 0.5rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .settings-menu-item:hover {
+            background-color: #f3f4f6;
+        }
+        .settings-menu-item.active {
+            background-color: var(--accent-primary);
+            color: white;
+        }
+
 
         /* Responsive Design */
         @media (max-width: 1024px) {
@@ -503,7 +519,7 @@
         let announcements = [];
         let liveClasses = [];
         let classSubjects = {};
-        let settings = {};
+        let settings = { feeConfig: { lateFeeType: 'none', lateFeeAmount: 0, gracePeriod: 0 }};
         let db;
         let confirmationCallback = null;
 
@@ -579,11 +595,17 @@
         }
 
         function loadData() {
-            const safeJSONParse = (key) => {
+            const safeJSONParse = (key, defaultValue = []) => {
                 try {
                     const data = localStorage.getItem(key);
-                    return (JSON.parse(data) || []).filter(Boolean);
-                } catch (e) { console.error(`Failed to parse ${key}`, e); return []; }
+                    const parsed = JSON.parse(data);
+                    // For arrays, ensure it's an array and filter out nulls
+                    if (Array.isArray(defaultValue)) {
+                         return (Array.isArray(parsed) ? parsed : defaultValue).filter(Boolean);
+                    }
+                    // For objects, return parsed or default
+                    return parsed || defaultValue;
+                } catch (e) { console.error(`Failed to parse ${key}`, e); return defaultValue; }
             };
 
             feeRecords = safeJSONParse('schoolFeeRecords');
@@ -594,21 +616,19 @@
             salaryRecords = safeJSONParse('schoolSalaries');
             announcements = safeJSONParse('schoolAnnouncements');
             liveClasses = safeJSONParse('schoolLiveClasses');
-
-            try {
-                classSubjects = JSON.parse(localStorage.getItem('schoolSubjects')) || {};
-                settings = JSON.parse(localStorage.getItem('schoolSettings')) || {};
-            } catch (e) { 
-                classSubjects = {};
-                settings = {}; 
+            classSubjects = safeJSONParse('schoolSubjects', {});
+            settings = safeJSONParse('schoolSettings', { feeConfig: { lateFeeType: 'none', lateFeeAmount: 0, gracePeriod: 0 } });
+            if (!settings.feeConfig) {
+                settings.feeConfig = { lateFeeType: 'none', lateFeeAmount: 0, gracePeriod: 0 };
             }
+
 
             // Data normalization
             feeRecords.forEach(fr => {
                 fr.lastUpdated = fr.lastUpdated || new Date().toISOString();
                 if (!Array.isArray(fr.payments)) fr.payments = [];
                 fr.receivedPayment = fr.payments.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
-                fr.status = (fr.receivedPayment >= fr.totalAmount) ? 'Paid' : 'Pending';
+                fr.status = (fr.receivedPayment >= (fr.totalAmount - (fr.discount || 0))) ? 'Paid' : 'Pending';
             });
             [students, staff, salaryRecords].forEach(arr => arr.forEach(s => { s.lastUpdated = s.lastUpdated || new Date().toISOString() }));
         }
@@ -692,8 +712,53 @@
             }
         }
 
+        async function saveSettings() {
+            try {
+                await db.ref('settings').set(settings);
+                saveLocalData();
+                showToast("Settings saved successfully!");
+            } catch (err) {
+                showToast("Error saving settings: " + err.message, 4000);
+            }
+        }
+
 
         // --- CORE LOGIC & RENDERING ---
+        function getFeeDetails(record) {
+            const now = new Date();
+            // strip time from today's date for accurate comparison
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            const dueDate = new Date(record.dueDate);
+            
+            let lateFee = 0;
+            const feeConfig = settings.feeConfig || { lateFeeType: 'none', lateFeeAmount: 0, gracePeriod: 0 };
+            const gracePeriod = parseInt(feeConfig.gracePeriod) || 0;
+            
+            // Due date + grace period
+            const effectiveDueDate = new Date(dueDate.getTime());
+            effectiveDueDate.setDate(effectiveDueDate.getDate() + gracePeriod);
+
+            const isOverdue = today > effectiveDueDate && record.status === 'Pending';
+
+            if (isOverdue) {
+                if (feeConfig.lateFeeType === 'fixed') {
+                    lateFee = parseFloat(feeConfig.lateFeeAmount) || 0;
+                } else if (feeConfig.lateFeeType === 'perDay') {
+                    const daysLate = Math.floor((today - effectiveDueDate) / (1000 * 60 * 60 * 24));
+                    if (daysLate > 0) {
+                        lateFee = daysLate * (parseFloat(feeConfig.lateFeeAmount) || 0);
+                    }
+                }
+            }
+
+            const totalAmount = parseFloat(record.totalAmount) || 0;
+            const discount = parseFloat(record.discount) || 0;
+            const receivedPayment = parseFloat(record.receivedPayment) || 0;
+            const balance = totalAmount - discount + lateFee - receivedPayment;
+            
+            return { totalAmount, discount, lateFee, receivedPayment, balance: Math.max(0, balance), isOverdue };
+        }
+        
         function renderDashboard() {
             const today = new Date().toISOString().split('T')[0];
             const allPayments = feeRecords.filter(Boolean).flatMap(fr => fr.payments || []);
@@ -704,7 +769,10 @@
 
             const totalDues = feeRecords
                 .filter(fr => fr && fr.status === 'Pending')
-                .reduce((sum, fr) => sum + ((fr.totalAmount || 0) - (fr.receivedPayment || 0)), 0);
+                .reduce((sum, fr) => {
+                    const details = getFeeDetails(fr);
+                    return sum + details.balance;
+                }, 0);
             
             const recentPayments = feeRecords.filter(Boolean)
                 .flatMap(fr => (fr.payments || []).map(p => ({...p, studentId: fr.studentId, feeDesc: fr.description})))
@@ -768,11 +836,17 @@
                                 <input type="text" id="fatherName" class="form-input mt-1" required>
                             </div>
                         </div>
-                         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                              <div>
                                 <label for="mobile" class="block text-sm font-medium text-gray-700">Mobile Number</label>
                                 <input type="tel" id="mobile" class="form-input mt-1" required>
                             </div>
+                            <div>
+                                <label for="scholarshipPercent" class="block text-sm font-medium text-gray-700">Scholarship Discount (%)</label>
+                                <input type="number" id="scholarshipPercent" class="form-input mt-1" min="0" max="100" value="0">
+                            </div>
+                        </div>
+                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                              <div>
                                 <label for="className" class="block text-sm font-medium text-gray-700">Class</label>
                                 <select id="className" class="form-select mt-1" required>
@@ -816,6 +890,7 @@
                         className: document.getElementById('className').value,
                         section: document.getElementById('section').value,
                         address: document.getElementById('address').value,
+                        scholarshipPercent: parseFloat(document.getElementById('scholarshipPercent').value) || 0,
                         admissionDate: new Date().toISOString(),
                         lastUpdated: new Date().toISOString()
                     };
@@ -855,6 +930,18 @@
                                 <input type="number" id="totalAmount" class="form-input mt-1" required step="0.01" min="0">
                             </div>
                         </div>
+                        <div class="p-3 bg-indigo-50 rounded-lg border border-indigo-200">
+                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label for="manualDiscount" class="block text-sm font-medium text-gray-700">Additional Discount/Waiver (₹)</label>
+                                    <input type="number" id="manualDiscount" class="form-input mt-1" step="0.01" min="0" placeholder="0">
+                                </div>
+                                <div id="scholarship-display" class="hidden mt-1">
+                                    <p class="text-sm font-medium text-gray-700">Scholarship Applied</p>
+                                    <p id="scholarship-amount" class="font-bold text-indigo-600 text-lg"></p>
+                                </div>
+                             </div>
+                        </div>
                          <div>
                             <label for="dueDate" class="block text-sm font-medium text-gray-700">Due Date</label>
                             <input type="date" id="dueDate" class="form-input mt-1" required value="${new Date().toISOString().split('T')[0]}">
@@ -865,6 +952,25 @@
                     </form>
                 </div>
             `;
+
+            document.getElementById('studentId').addEventListener('change', (e) => {
+                const studentId = e.target.value;
+                const totalAmount = parseFloat(document.getElementById('totalAmount').value) || 0;
+                const student = students.find(s => s.id === studentId);
+                const scholarshipDisplay = document.getElementById('scholarship-display');
+                if (student && student.scholarshipPercent > 0 && totalAmount > 0) {
+                    const scholarshipAmount = totalAmount * (student.scholarshipPercent / 100);
+                    document.getElementById('scholarship-amount').textContent = `- ₹${scholarshipAmount.toLocaleString('en-IN')}`;
+                    scholarshipDisplay.classList.remove('hidden');
+                } else {
+                    scholarshipDisplay.classList.add('hidden');
+                }
+            });
+            document.getElementById('totalAmount').addEventListener('input', () => {
+                document.getElementById('studentId').dispatchEvent(new Event('change'));
+            });
+
+
             document.getElementById('new-fee-form').addEventListener('submit', async (e) => {
                 e.preventDefault();
                 const form = e.target;
@@ -872,11 +978,21 @@
                 submitButton.disabled = true;
                 submitButton.innerHTML = 'Creating...';
                 try {
+                    const studentId = document.getElementById('studentId').value;
+                    const totalAmount = parseFloat(document.getElementById('totalAmount').value);
+                    const student = students.find(s => s.id === studentId);
+                    
+                    let totalDiscount = parseFloat(document.getElementById('manualDiscount').value) || 0;
+                    if (student && student.scholarshipPercent > 0) {
+                        totalDiscount += totalAmount * (student.scholarshipPercent / 100);
+                    }
+
                     const newRecord = {
                         id: Date.now().toString(),
-                        studentId: document.getElementById('studentId').value,
+                        studentId: studentId,
                         description: document.getElementById('feeDescription').value,
-                        totalAmount: parseFloat(document.getElementById('totalAmount').value),
+                        totalAmount: totalAmount,
+                        discount: totalDiscount,
                         dueDate: document.getElementById('dueDate').value,
                         creationDate: new Date().toISOString(),
                         lastUpdated: new Date().toISOString(),
@@ -951,7 +1067,10 @@
                     case 'studentName': valA = studentA?.studentName; valB = studentB?.studentName; break;
                     case 'totalAmount': valA = a.totalAmount; valB = b.totalAmount; break;
                     case 'receivedPayment': valA = a.receivedPayment; valB = b.receivedPayment; break;
-                    case 'balance': valA = (a.totalAmount || 0) - (a.receivedPayment || 0); valB = (b.totalAmount || 0) - (b.receivedPayment || 0); break;
+                    case 'balance': 
+                        valA = getFeeDetails(a).balance;
+                        valB = getFeeDetails(b).balance;
+                        break;
                     default: valA = a[sortBy]; valB = b[sortBy];
                 }
 
@@ -967,18 +1086,20 @@
                     console.warn(`Orphaned fee record found: ${record.id} for missing student: ${record.studentId}`);
                     return '';
                 }
-                const balance = (record.totalAmount || 0) - (record.receivedPayment || 0);
+                const details = getFeeDetails(record);
                 const statusClass = record.status === 'Paid' ? 'status-paid' : 'status-pending';
                 return `
                     <tr>
-                        <td class="font-semibold">${student.studentName}</td>
-                        <td>${record.description}</td>
-                        <td>₹${(record.totalAmount || 0).toLocaleString('en-IN')}</td>
-                        <td class="text-green-600">₹${(record.receivedPayment || 0).toLocaleString('en-IN')}</td>
-                        <td class="font-semibold ${balance > 0 ? 'text-red-600' : ''}">₹${balance.toLocaleString('en-IN')}</td>
+                        <td class="font-semibold">${student.studentName} <br> <span class="text-xs text-gray-500 font-normal">${record.description}</span></td>
+                        <td>₹${(details.totalAmount || 0).toLocaleString('en-IN')}</td>
+                        <td class="text-blue-600">₹${(details.discount || 0).toLocaleString('en-IN')}</td>
+                        <td class="text-red-600">₹${(details.lateFee || 0).toLocaleString('en-IN')}</td>
+                        <td class="text-green-600">₹${(details.receivedPayment || 0).toLocaleString('en-IN')}</td>
+                        <td class="font-semibold ${details.balance > 0 ? 'text-red-600' : ''}">₹${details.balance.toLocaleString('en-IN')}</td>
                         <td><span class="status-badge ${statusClass}">${record.status}</span></td>
-                        <td class="flex gap-4">
+                        <td class="flex gap-2">
                             ${record.status === 'Pending' ? `<button onclick="openFeeModal('${record.id}')" class="font-semibold text-indigo-600 hover:text-indigo-800">Receive</button>` : ''}
+                            <button onclick="editFeeRecord('${record.id}')" class="font-semibold text-gray-500 hover:text-indigo-800">Edit</button>
                             <button onclick="deleteFeeRecord('${record.id}')" class="font-semibold text-gray-500 hover:text-red-600">Delete</button>
                         </td>
                     </tr>
@@ -990,9 +1111,10 @@
                     <table class="w-full">
                         <thead>
                             <tr>
-                                ${generateSortableHeader('Student', 'studentName', sortBy, sortOrder)}
-                                ${generateSortableHeader('Description', 'description', sortBy, sortOrder)}
+                                ${generateSortableHeader('Student / Fee', 'studentName', sortBy, sortOrder)}
                                 ${generateSortableHeader('Total', 'totalAmount', sortBy, sortOrder)}
+                                ${generateSortableHeader('Discount', 'discount', sortBy, sortOrder)}
+                                ${generateSortableHeader('Late Fee', 'lateFee', sortBy, sortOrder)}
                                 ${generateSortableHeader('Paid', 'receivedPayment', sortBy, sortOrder)}
                                 ${generateSortableHeader('Balance', 'balance', sortBy, sortOrder)}
                                 ${generateSortableHeader('Status', 'status', sortBy, sortOrder)}
@@ -1000,7 +1122,7 @@
                             </tr>
                         </thead>
                         <tbody>
-                            ${rows || `<tr><td colspan="7" class="text-center p-8 text-gray-500">No matching fee records found.</td></tr>`}
+                            ${rows || `<tr><td colspan="8" class="text-center p-8 text-gray-500">No matching fee records found.</td></tr>`}
                         </tbody>
                     </table>
                 </div>
@@ -1051,8 +1173,8 @@
                     <td class="font-semibold">${s.studentName}</td>
                     <td>${s.fatherName}</td>
                     <td>${s.mobile}</td>
-                    <td>${s.className}</td>
-                    <td>${s.section || 'A'}</td>
+                    <td>${s.className}-${s.section || 'A'}</td>
+                    <td>${s.scholarshipPercent || 0}%</td>
                     <td class="flex gap-4">
                         <button onclick="editStudent('${s.id}')" class="font-semibold text-indigo-600 hover:text-indigo-800">Edit</button>
                         <button onclick="deleteStudent('${s.id}')" class="font-semibold text-gray-500 hover:text-red-600">Delete</button>
@@ -1070,7 +1192,7 @@
                                 ${generateSortableHeader("Father's Name", 'fatherName', sortBy, sortOrder)}
                                 ${generateSortableHeader('Mobile', 'mobile', sortBy, sortOrder)}
                                 ${generateSortableHeader('Class', 'className', sortBy, sortOrder)}
-                                ${generateSortableHeader('Section', 'section', sortBy, sortOrder)}
+                                ${generateSortableHeader('Scholarship', 'scholarshipPercent', sortBy, sortOrder)}
                                 <th>Actions</th>
                             </tr>
                         </thead>
@@ -1740,28 +1862,45 @@
         function renderBackupRestore() {  mainContent.innerHTML = `<h2 class="text-3xl font-bold">Backup & Restore</h2><p class="text-gray-500 mt-4">This feature is under construction.</p>`; }
        
         function renderSettings() {
-            const uniqueClasses = [...new Set(students.map(s => s.className).filter(Boolean))].sort();
             mainContent.innerHTML = `
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-8">
                     <div class="md:col-span-1">
-                        <div class="card">
-                            <h3 class="font-bold text-lg mb-4">School Settings</h3>
+                        <div class="card p-4">
+                            <h3 class="font-bold text-lg mb-4 px-3">School Settings</h3>
                             <ul id="settings-menu" class="space-y-1">
-                                <li><a href="#" data-section="subjects" class="block p-3 rounded-lg font-semibold bg-indigo-100 text-indigo-700">Subject Management</a></li>
+                                <li><a data-section="subjects" class="settings-menu-item">Subject Management</a></li>
+                                <li><a data-section="fees" class="settings-menu-item">Fee Settings</a></li>
                             </ul>
                         </div>
                     </div>
-                    <div id="settings-content" class="md:col-span-2">
+                    <div id="settings-content" class="md:col-span-3">
                         <!-- Content will be loaded here -->
                     </div>
                 </div>
             `;
-            renderSubjectSettings(uniqueClasses);
+            
+            const menu = document.getElementById('settings-menu');
+            menu.addEventListener('click', e => {
+                e.preventDefault();
+                const target = e.target.closest('a');
+                if(!target) return;
+                
+                menu.querySelectorAll('a').forEach(a => a.classList.remove('active'));
+                target.classList.add('active');
+                
+                const section = target.dataset.section;
+                if (section === 'subjects') renderSubjectSettings();
+                else if (section === 'fees') renderFeeSettings();
+            });
+            
+            // Load initial section
+            menu.querySelector('a[data-section="subjects"]').click();
         }
 
-        function renderSubjectSettings(uniqueClasses) {
+        function renderSubjectSettings() {
             const container = document.getElementById('settings-content');
             if (!container) return;
+            const uniqueClasses = [...new Set(students.map(s => s.className).filter(Boolean))].sort();
             const classOptions = uniqueClasses.map(c => `<option value="${c}">${c}</option>`).join('');
 
             container.innerHTML = `
@@ -1856,6 +1995,59 @@
                 addSubject(className);
             });
         }
+
+        function renderFeeSettings() {
+            const container = document.getElementById('settings-content');
+            if (!container) return;
+            const feeConfig = settings.feeConfig || {};
+
+            container.innerHTML = `
+                <form id="fee-settings-form" class="card">
+                    <h3 class="font-bold text-xl mb-4">Late Fee Configuration</h3>
+                    <div class="space-y-4">
+                        <div>
+                            <label for="lateFeeType" class="block text-sm font-medium text-gray-700">Late Fee Type</label>
+                            <select id="lateFeeType" class="form-select mt-1">
+                                <option value="none" ${feeConfig.lateFeeType === 'none' ? 'selected' : ''}>No Late Fee</option>
+                                <option value="fixed" ${feeConfig.lateFeeType === 'fixed' ? 'selected' : ''}>Fixed Amount</option>
+                                <option value="perDay" ${feeConfig.lateFeeType === 'perDay' ? 'selected' : ''}>Per Day Penalty</option>
+                            </select>
+                        </div>
+                        <div id="late-fee-details" class="space-y-4">
+                             <div>
+                                <label for="lateFeeAmount" class="block text-sm font-medium text-gray-700">Late Fee Amount (₹)</label>
+                                <input type="number" id="lateFeeAmount" class="form-input mt-1" min="0" value="${feeConfig.lateFeeAmount || 0}">
+                            </div>
+                             <div>
+                                <label for="gracePeriod" class="block text-sm font-medium text-gray-700">Grace Period (Days after due date)</label>
+                                <input type="number" id="gracePeriod" class="form-input mt-1" min="0" value="${feeConfig.gracePeriod || 0}">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flex justify-end mt-6">
+                        <button type="submit" class="bg-indigo-600 text-white font-semibold py-2 px-6 rounded-lg hover:bg-indigo-700">Save Settings</button>
+                    </div>
+                </form>
+            `;
+
+            const typeSelect = document.getElementById('lateFeeType');
+            const detailsDiv = document.getElementById('late-fee-details');
+            const toggleDetails = () => {
+                detailsDiv.style.display = typeSelect.value === 'none' ? 'none' : 'block';
+            };
+            typeSelect.addEventListener('change', toggleDetails);
+            toggleDetails();
+
+            document.getElementById('fee-settings-form').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                settings.feeConfig = {
+                    lateFeeType: document.getElementById('lateFeeType').value,
+                    lateFeeAmount: parseFloat(document.getElementById('lateFeeAmount').value) || 0,
+                    gracePeriod: parseInt(document.getElementById('gracePeriod').value) || 0
+                };
+                await saveSettings();
+            });
+        }
         
         // --- MODAL & CRUD HANDLERS ---
         function openFeeModal(recordId) {
@@ -1868,18 +2060,22 @@
                 return;
             }
 
-            const balance = (record.totalAmount || 0) - (record.receivedPayment || 0);
+            const details = getFeeDetails(record);
 
             openFormModal('Receive Fee', `
                 <input type="hidden" id="recordId" value="${recordId}">
-                <div class="mb-4 p-4 bg-gray-50 rounded-lg">
-                  <p class="text-sm text-gray-600">Student: <strong class="text-gray-900">${student.studentName}</strong></p>
-                  <p class="text-sm text-gray-600">Fee: <strong class="text-gray-900">${record.description}</strong></p>
-                  <p class="text-sm text-gray-600">Balance: <strong class="text-red-600">₹${balance.toLocaleString('en-IN')}</strong></p>
+                <div class="mb-4 p-4 bg-gray-50 rounded-lg space-y-1 text-sm">
+                  <div class="flex justify-between"><span class="text-gray-600">Student:</span><strong class="text-gray-900">${student.studentName}</strong></div>
+                  <div class="flex justify-between"><span class="text-gray-600">Fee:</span><strong class="text-gray-900">${record.description}</strong></div>
+                  <div class="flex justify-between"><span class="text-gray-600">Total Amount:</span><span>₹${details.totalAmount.toLocaleString('en-IN')}</span></div>
+                  <div class="flex justify-between text-blue-600"><span >Discount:</span><span>- ₹${details.discount.toLocaleString('en-IN')}</span></div>
+                  <div class="flex justify-between text-red-600"><span >Late Fee:</span><span>+ ₹${details.lateFee.toLocaleString('en-IN')}</span></div>
+                  <div class="flex justify-between text-green-600"><span >Paid:</span><span>- ₹${details.receivedPayment.toLocaleString('en-IN')}</span></div>
+                  <div class="flex justify-between font-bold text-base mt-2 pt-2 border-t"><span >Balance Due:</span><span class="text-red-600">₹${details.balance.toLocaleString('en-IN')}</span></div>
                 </div>
                 <div>
                     <label class="block text-sm font-medium">Amount to Receive</label>
-                    <input type="number" id="fee-amount" class="form-input mt-1" required step="0.01" min="0" value="${balance.toFixed(2)}">
+                    <input type="number" id="fee-amount" class="form-input mt-1" required step="0.01" min="0" value="${details.balance.toFixed(2)}">
                 </div>
                 <div>
                     <label class="block text-sm font-medium">Payment Mode</label>
@@ -1909,8 +2105,11 @@
                             mode,
                             date: new Date().toISOString()
                         });
+                        
+                        // Recalculate totals
                         feeRecords[recordIndex].receivedPayment = (feeRecords[recordIndex].receivedPayment || 0) + amount;
-                        if (feeRecords[recordIndex].receivedPayment >= feeRecords[recordIndex].totalAmount) {
+                        const finalDetails = getFeeDetails(feeRecords[recordIndex]);
+                        if (finalDetails.balance <= 0) {
                             feeRecords[recordIndex].status = 'Paid';
                         }
                         feeRecords[recordIndex].lastUpdated = new Date().toISOString();
@@ -1939,7 +2138,10 @@
                 <input type="hidden" id="studentId" value="${student.id}">
                 <div><label class="block text-sm font-medium">Student Name</label><input type="text" id="studentName" class="form-input mt-1" value="${student.studentName || ''}" required></div>
                 <div><label class="block text-sm font-medium">Father's Name</label><input type="text" id="fatherName" class="form-input mt-1" value="${student.fatherName || ''}" required></div>
-                <div><label class="block text-sm font-medium">Mobile</label><input type="tel" id="mobile" class="form-input mt-1" value="${student.mobile || ''}" required></div>
+                <div class="grid grid-cols-2 gap-4">
+                     <div><label class="block text-sm font-medium">Mobile</label><input type="tel" id="mobile" class="form-input mt-1" value="${student.mobile || ''}" required></div>
+                     <div><label class="block text-sm font-medium">Scholarship (%)</label><input type="number" id="scholarshipPercent" class="form-input mt-1" value="${student.scholarshipPercent || 0}" min="0" max="100"></div>
+                </div>
                 <div class="grid grid-cols-2 gap-4">
                     <div><label class="block text-sm font-medium">Class</label><input type="text" id="className" class="form-input mt-1" value="${student.className || ''}" required></div>
                     <div>
@@ -1968,6 +2170,7 @@
                             studentName: form.querySelector('#studentName').value,
                             fatherName: form.querySelector('#fatherName').value,
                             mobile: form.querySelector('#mobile').value,
+                            scholarshipPercent: parseFloat(form.querySelector('#scholarshipPercent').value) || 0,
                             className: form.querySelector('#className').value,
                             section: form.querySelector('#section').value,
                             address: form.querySelector('#address').value,
@@ -2439,6 +2642,69 @@
                 }
             });
         }
+        
+        function editFeeRecord(recordId) {
+            const record = feeRecords.find(r => r.id === recordId);
+            if (!record) return;
+
+            openFormModal('Edit Fee Record', `
+                <input type="hidden" id="recordId" value="${record.id}">
+                <div>
+                    <label class="block text-sm font-medium">Description</label>
+                    <input type="text" id="description" class="form-input mt-1" value="${record.description || ''}" required>
+                </div>
+                 <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium">Total Amount (₹)</label>
+                        <input type="number" id="totalAmount" class="form-input mt-1" value="${record.totalAmount || 0}" required>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium">Discount (₹)</label>
+                        <input type="number" id="discount" class="form-input mt-1" value="${record.discount || 0}">
+                    </div>
+                 </div>
+                 <div>
+                    <label class="block text-sm font-medium">Due Date</label>
+                    <input type="date" id="dueDate" class="form-input mt-1" value="${record.dueDate || ''}" required>
+                </div>
+                <div class="flex justify-end gap-3 pt-4">
+                    <button type="button" class="form-modal-cancel px-4 py-2 bg-gray-200 text-gray-800 font-semibold rounded-lg hover:bg-gray-300">Cancel</button>
+                    <button type="submit" class="px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700">Save Changes</button>
+                </div>
+            `, async (form) => {
+                 const submitButton = form.querySelector('button[type="submit"]');
+                submitButton.disabled = true;
+                submitButton.innerHTML = 'Saving...';
+                try {
+                    const index = feeRecords.findIndex(r => r.id === recordId);
+                    if (index > -1) {
+                         const updatedRecord = { ...feeRecords[index],
+                            description: form.querySelector('#description').value,
+                            totalAmount: parseFloat(form.querySelector('#totalAmount').value),
+                            discount: parseFloat(form.querySelector('#discount').value) || 0,
+                            dueDate: form.querySelector('#dueDate').value,
+                            lastUpdated: new Date().toISOString()
+                        };
+                        // Recalculate status
+                        const finalDetails = getFeeDetails(updatedRecord);
+                        updatedRecord.status = finalDetails.balance <= 0 ? 'Paid' : 'Pending';
+
+                        await db.ref('feeRecords/' + recordId).set(updatedRecord);
+                        feeRecords[index] = updatedRecord;
+                        saveLocalData();
+                        showToast('Fee record updated.');
+                        renderLedgerTable();
+                    }
+                } catch(err) {
+                    showToast('Error updating record: ' + err.message, 4000);
+                    return false;
+                } finally {
+                    submitButton.disabled = false;
+                    submitButton.innerHTML = 'Save Changes';
+                }
+                return true;
+            });
+        }
 
         function openFormModal(title, formHTML, onSubmit) {
             const modal = document.getElementById('form-modal');
@@ -2484,7 +2750,7 @@
             });
             document.getElementById('fab-action-admission').addEventListener('click', () => { setActiveTab('new-admission'); fabContainer.classList.remove('active'); });
             document.getElementById('fab-action-fee').addEventListener('click', () => { setActiveTab('add-fee'); fabContainer.classList.remove('active'); });
-            document.getElementById('fab-action-announcement').addEventListener('click', () => { setActiveTab('announcements'); fabContainer.classList.remove('active'); });
+            document.getElementById('fab-action-announcement').addEventListener('click', () => { setActiveTab('announcements'); editAnnouncement(null); fabContainer.classList.remove('active'); });
         }
         
         function handleGlobalSearch() {
@@ -2615,7 +2881,8 @@
 
                 try {
                     // Pre-load all data for the admin panel after "login"
-                    await syncData(); // Use sync which fetches and saves all data
+                    loadData(); // Load local data first for speed
+                    await syncData(); // Then sync with cloud
 
                     loginCard.innerHTML = `
                         <div class="text-center mb-6">
@@ -2653,5 +2920,6 @@
         }
         document.addEventListener('DOMContentLoaded', initApp);
     </script>
+
 
 <script src="./script.js"></script></body></html>
